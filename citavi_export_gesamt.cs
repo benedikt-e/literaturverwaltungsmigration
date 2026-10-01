@@ -13,14 +13,16 @@ using SwissAcademic.Citavi.Shell;
 using SwissAcademic.Collections;
 
 // ===========================================================================
-// PRODUKTIONSEXPORT Citavi -> Zotero
+// PRODUKTIONSEXPORT Citavi -> Zotero (Version 2)
 //
-// Aendert NICHTS am Projekt. Schreibt drei Dinge in den Zielordner:
+// Aendert NICHTS am Projekt. Schreibt vier Dinge in den Zielordner:
 //   1. projekt.xml          - der vollstaendige Export in der Stufe Citavi6
 //                             (die einzige, die Zoteros Uebersetzer annimmt)
 //   2. die Anhangdateien    - flach daneben, weil der Zotero-Importfilter
 //                             relative Dateinamen relativ zur XML-Datei sucht
 //   3. kennzahlen.txt       - Sollwerte fuer die Abnahme nach dem Import
+//   4. kennzahlen.json      - dieselben Sollwerte maschinenlesbar, fuer den
+//                             automatischen Vergleich im Nachbearbeitungsskript
 //
 // Danach: den Zielordner unveraendert lassen und die XML-Datei von dort aus
 // in Zotero importieren.
@@ -35,6 +37,9 @@ public static class CitaviMacro
 	// Anhangdateien mitkopieren
 	static bool ANHAENGE_KOPIEREN = true;
 	// ------------------------------------------------------------------------
+
+	// wird in Kennzahlen() gefuellt und in Main() geschrieben
+	static string kennzahlenJson = null;
 
 	public static void Main()
 	{
@@ -72,6 +77,12 @@ public static class CitaviMacro
 
 		string bericht = System.IO.Path.Combine(ZIEL, "kennzahlen.txt");
 		System.IO.File.WriteAllText(bericht, sb.ToString(), Encoding.UTF8);
+		if (kennzahlenJson != null)
+		{
+			// ohne Byte-Order-Mark, damit JSON-Leser nicht stolpern
+			System.IO.File.WriteAllText(System.IO.Path.Combine(ZIEL, "kennzahlen.json"),
+				kennzahlenJson, new UTF8Encoding(false));
+		}
 		MessageBox.Show("Fertig.\n\n" + ZIEL + "\n\nBericht: kennzahlen.txt", "Produktionsexport");
 	}
 
@@ -154,11 +165,18 @@ public static class CitaviMacro
 
 		Dictionary<string, int> nachZitattyp = new Dictionary<string, int>();
 		int wissen = 0, mitKategorie = 0, mitSchlagwort = 0, mitGruppe = 0, dateien = 0;
-		int katZuweisungen = 0;
+		int katZuweisungen = 0, gedanken = 0;
 		foreach (object ki in Enum2(Get(project, "AllKnowledgeItems")))
 		{
 			wissen++;
-			Bump(nachZitattyp, Safe(Get(ki, "QuotationType")));
+			// Freie Gedanken haben keinen Titel. Der Importfilter legt sie als
+			// Einzelnotizen an und nennt sie "Gedanke", wenn sie keinen
+			// Zitattyp tragen. Hier genauso zaehlen, damit Soll und Ist
+			// dieselben Namen haben.
+			bool ohneTitel = Get(ki, "Reference") == null;
+			if (ohneTitel) gedanken++;
+			string zitattyp = Safe(Get(ki, "QuotationType"));
+			Bump(nachZitattyp, ohneTitel && zitattyp == "None" ? "Gedanke" : zitattyp);
 			int kats = Count(Get(ki, "Categories"));
 			if (kats > 0) { mitKategorie++; katZuweisungen += kats; }
 			if (Count(Get(ki, "Keywords")) > 0) mitSchlagwort++;
@@ -187,6 +205,7 @@ public static class CitaviMacro
 		sb.AppendLine("  Wissenselemente gesamt:        " + wissen + "   <- so viele Notizen erwartet");
 		foreach (KeyValuePair<string, int> kv in nachZitattyp.OrderByDescending(x => x.Value))
 			sb.AppendLine("     " + kv.Value + "\t" + Zitattyp(kv.Key));
+		sb.AppendLine("  davon ohne Titelbezug:         " + gedanken + "   <- so viele Einzelnotizen erwartet");
 		sb.AppendLine("  mit Kategorie:                 " + mitKategorie + " (" + katZuweisungen + " Zuweisungen)");
 		sb.AppendLine("  mit Schlagwort:                " + mitSchlagwort);
 		sb.AppendLine("  mit Gruppe:                    " + mitGruppe);
@@ -205,6 +224,27 @@ public static class CitaviMacro
 		sb.AppendLine("  Titel nach Dokumententyp:");
 		foreach (KeyValuePair<string, int> kv in nachTyp.OrderByDescending(x => x.Value))
 			sb.AppendLine("     " + kv.Value + "\t" + kv.Key);
+
+		// Dieselben Sollwerte als JSON. Die Schluessel liest das
+		// Nachbearbeitungsskript, Zitattypen unter ihrem Citavi-Namen.
+		StringBuilder js = new StringBuilder();
+		js.Append("{\n");
+		js.Append("  \"titel\": " + titel + ",\n");
+		js.Append("  \"beitraegeMitSammelwerk\": " + mitEltern + ",\n");
+		js.Append("  \"wissenselemente\": " + wissen + ",\n");
+		js.Append("  \"ohneTitelbezug\": " + gedanken + ",\n");
+		js.Append("  \"kategorienZuweisungen\": " + katZuweisungen + ",\n");
+		js.Append("  \"kategorien\": " + Count(Get(project, "AllCategories")) + ",\n");
+		js.Append("  \"aufgaben\": " + Count(Get(project, "AllTaskItems")) + ",\n");
+		js.Append("  \"zitattypen\": {");
+		bool erster = true;
+		foreach (KeyValuePair<string, int> kv in nachZitattyp)
+		{
+			js.Append((erster ? "" : ",") + "\n    \"" + kv.Key.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\": " + kv.Value);
+			erster = false;
+		}
+		js.Append("\n  }\n}\n");
+		kennzahlenJson = js.ToString();
 	}
 
 	static string Zitattyp(string roh)

@@ -1,6 +1,6 @@
 {
 	"translatorID": "b7f1a3d2-90c4-4e17-8a6f-2c5d4e9b1077",
-	"label": "Citavi 5 XML (erweitert)",
+	"label": "Citavi 5 XML (erweitert v2)",
 	"creator": "Philipp Zumstein, Tomasz Najdek; Erweiterung: verlustarme Migration",
 	"target": "xml",
 	"minVersion": "3.0",
@@ -12,7 +12,7 @@
 	},
 	"inRepository": false,
 	"translatorType": 1,
-	"lastUpdated": "2025-01-04 01:03:00"
+	"lastUpdated": "2026-10-02 18:00:00"
 }
 
 /*
@@ -125,6 +125,18 @@ var CZ = {
 	knowledgeItemFilesAsAttachments: true,
 	// weitere Titelfelder, die der Originalfilter ignoriert
 	extraTitleFields: true,
+	// Formatierung der Zitate (kursiv, fett …) aus TextHtml uebernehmen,
+	// soweit Citavi sie liefert. Aus: immer Klartext.
+	keepFormatting: true,
+	// Sternebewertung und Markierungen der Titel sowie die Relevanz der
+	// Wissenselemente als Tags (Bewertung/…, Markierung/1, Relevanz/…)
+	ratingsAsTags: true,
+	// befuellte Freitextfelder unter ihrer Bezeichnung ins Feld "Extra"
+	customFieldsToExtra: true,
+	// Titel zusaetzlich in jede Kategoriensammlung legen, in der eines
+	// ihrer Wissenselemente steckt. Standardmaessig aus: Die Kategorien
+	// ordnen in Citavi das Wissen, nicht die Literatur.
+	referencesIntoKnowledgeCategories: false,
 	// Praefix fuer die Tags
 	tagPrefixType: "Zitat/",
 	tagPrefixCategory: "Kat/",
@@ -142,7 +154,15 @@ var czQuotationTypes = [
 	{ key: "QuickReference", label: "Kurzbeleg", tag: "Kurzbeleg" }
 ];
 
+// Freie Gedanken: Wissenselemente ohne Titelbezug. In Citavi tragen sie in
+// der Regel keinen Zitattyp. Statt "Datei / ohne Zitattyp" heissen sie dann
+// in Typzeile und Tag "Gedanke".
+var czThoughtType = { key: "Thought", label: "Gedanke", tag: "Gedanke" };
+
 var czKiCategories = {}; // Wissenselement-Id -> [{ path, position }]
+var czKiCategoryIds = {}; // Wissenselement-Id -> [Kategorie-Id]
+var czThoughtIds = []; // Ids der importierten freien Gedanken
+var czCustomFieldLabels = {}; // "CustomField1" -> Bezeichnung
 var czKiKeywords = {}; // Wissenselement-Id -> [Name]
 var czCategoryPath = {}; // Kategorie-Id -> "3.2 Feldzugang"
 var czRefLabel = {}; // Titel-Id -> Kurzbeleg
@@ -173,6 +193,79 @@ function czDate(s) {
 	return m ? m[1] + " " + m[2] : null;
 }
 
+// Zeitstempel fuer Menschen: in Fusszeile und "Extra" steht die Zeit in der
+// Zeitzone des Rechners, auf dem importiert wird, im deutschen Format
+// "01.10.2026 21:30:41", ohne Angabe einer Zeitzone.
+// Citavi 6 und 7 speichern die Zeiten in UTC und schreiben dazu
+// <IsUtc>true</IsUtc> in den Export. Am Testprojekt belegt: LastChangeTime
+// "01.10.2026 21:35:10" (Ortszeit) entspricht ModifiedOn "19:35:05".
+// Das deutsche Format unterscheidet die Ortszeit fuer das
+// Nachbearbeitungsskript von den UTC-Zeiten aus Filter v1 ("2026-10-01 …").
+var czTimesAreUtc = true;
+
+function czLocalTime(s) {
+	var m = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$/.exec(czText(s));
+	if (!m) return s;
+	var d = czTimesAreUtc
+		? new Date(Date.UTC(+m[1], m[2] - 1, +m[3], +m[4], +m[5], +m[6]))
+		: new Date(+m[1], m[2] - 1, +m[3], +m[4], +m[5], +m[6]);
+	function two(n) {
+		return (n < 10 ? "0" : "") + n;
+	}
+	return two(d.getDate()) + "." + two(d.getMonth() + 1) + "." + d.getFullYear()
+		+ " " + two(d.getHours()) + ":" + two(d.getMinutes()) + ":" + two(d.getSeconds());
+}
+
+// Klartext aus Citavi fuer eine Notiz: maskieren, Zeilenumbrueche erhalten
+function czPlainToHtml(s) {
+	var text = czText(s).replace(/\r\n?/g, "\n").replace(/\n+$/, "");
+	return czEscape(text).replace(/\n/g, "<br>\n");
+}
+
+// Formatiertes HTML aus Citavi auf wenige sichere Auszeichnungen
+// beschraenken. Alles andere faellt weg, der Text bleibt erhalten.
+// Citavi 7 liefert in TextHtml <p>, <em>, <strong>, <ul>/<li> (geprueft am
+// Testprojekt, 01.10.2026). Unterstreichungen fehlen dort, sie stehen nur in
+// der RTF-Fassung TextFormatted und gehen deshalb verloren.
+var czAllowedTags = { i: "i", em: "i", b: "b", strong: "b", u: "u", sub: "sub", sup: "sup", p: "p", div: "p", br: "br", ul: "ul", ol: "ol", li: "li" };
+
+function czSanitizeHtml(html) {
+	var out = czText(html)
+		.replace(/<(script|style|head)[^>]*>[\s\S]*?<\/\1\s*>/gi, "")
+		.replace(/<!--[\s\S]*?-->/g, "")
+		.replace(/<\s*(\/?)\s*([a-zA-Z0-9]+)[^>]*>/g, function (all, slash, name) {
+			var tag = czAllowedTags[name.toLowerCase()];
+			if (!tag) return "";
+			if (tag == "br") return slash ? "" : "<br>";
+			return "<" + slash + tag + ">";
+		})
+		// einzelne "<" ohne Tag und "&" ohne Entitaet maskieren
+		.replace(/<(?!\/?(i|b|u|sub|sup|p|br|ul|ol|li)>)/g, "&lt;")
+		.replace(/&(?!(#\d+|#x[0-9a-fA-F]+|[a-zA-Z][a-zA-Z0-9]*);)/g, "&amp;")
+		.replace(/<p>\s*<\/p>/g, "")
+		.trim();
+	if (!out) return "";
+	return /^<(p|ul|ol)>/.test(out) ? out : "<p>" + out + "</p>";
+}
+
+// Text eines Wissenselements als HTML-Block, formatiert oder als Klartext
+function czKnowledgeItemText(node) {
+	var complexity = czText(ZU.xpathText(node, 'TextComplexity'));
+	var html = ZU.xpathText(node, 'TextHtml');
+	if (CZ.keepFormatting && html && complexity && complexity !== "0" && complexity !== "PureText") {
+		var clean = czSanitizeHtml(html);
+		if (clean) return clean + "\n";
+	}
+	var text = ZU.xpathText(node, 'Text');
+	return text ? "<p>" + czPlainToHtml(text) + "</p>\n" : "";
+}
+
+// Fusszeile mit den Citavi-Zeitstempeln einer Notiz
+function czDateFooter(created, modified) {
+	return "<p><em>Citavi: erstellt " + (created ? czLocalTime(created) : "?")
+		+ ", geändert " + (modified ? czLocalTime(modified) : "?") + "</em></p>\n";
+}
+
 // Eine OnetoN-Zeile hat die Form "quelleId;zielId:position;zielId:position"
 function czParseOneToN(text) {
 	var parts = czText(text).split(";");
@@ -190,9 +283,99 @@ function czParseOneToN(text) {
 	return result;
 }
 
-// Kategoriennummern so berechnen, wie der Originalfilter die Sammlungen
-// benennt, damit Tag und Sammlungsname zusammenpassen.
-function czBuildCategoryPaths(doc) {
+// --- Nachschlagetabellen (Version 2) ---
+// Der Originalfilter durchsucht fuer jeden Titel und jede Kategorie das
+// ganze Dokument, etwa mit '//KnowledgeItem[ReferenceID="…"]'. Der Aufwand
+// waechst damit mit dem Quadrat der Bestandsgroesse. Hier wird jede
+// Zuordnungstabelle einmal gelesen und nach Kennung abgelegt. Die Abfragen
+// unten liefern dieselben Werte in derselben Reihenfolge wie die
+// urspruenglichen XPath-Ausdruecke. Ein Vergleichstest gegen Version 1
+// auf mehreren Testbestaenden hat das bestaetigt.
+var czLookup = null;
+
+function czIndexRows(doc, expr) {
+	var bySource = {};
+	var byAnyId = {};
+	var rows = ZU.xpath(doc, expr);
+	for (let i = 0; i < rows.length; i++) {
+		var text = rows[i].textContent;
+		var row = czParseOneToN(text);
+		(bySource[row.source] || (bySource[row.source] = [])).push(text);
+		var seen = {};
+		var ids = [row.source].concat(row.targets.map(function (t) { return t.id; }));
+		for (let j = 0; j < ids.length; j++) {
+			if (seen[ids[j]]) continue;
+			seen[ids[j]] = true;
+			(byAnyId[ids[j]] || (byAnyId[ids[j]] = [])).push(text);
+		}
+	}
+	return { bySource: bySource, byAnyId: byAnyId };
+}
+
+function czGroupBy(nodes, childName) {
+	var map = {};
+	for (let i = 0; i < nodes.length; i++) {
+		var key = ZU.xpathText(nodes[i], childName);
+		if (key === null) continue;
+		(map[key] || (map[key] = [])).push(nodes[i]);
+	}
+	return map;
+}
+
+function czBuildLookup(doc) {
+	var byId = {};
+	var withId = ZU.xpath(doc, '//*[@id]');
+	for (let i = 0; i < withId.length; i++) {
+		var id = withId[i].getAttribute('id');
+		if (byId[id] === undefined) byId[id] = withId[i];
+	}
+	czLookup = {
+		byId: byId,
+		kisByRef: czGroupBy(ZU.xpath(doc, '//KnowledgeItems/KnowledgeItem'), 'ReferenceID'),
+		locationsByRef: czGroupBy(ZU.xpath(doc, '//Locations/Location'), 'ReferenceID'),
+		authors: czIndexRows(doc, '//ReferenceAuthors/OnetoN'),
+		editors: czIndexRows(doc, '//ReferenceEditors/OnetoN'),
+		collaborators: czIndexRows(doc, '//ReferenceCollaborators/OnetoN'),
+		organizations: czIndexRows(doc, '//ReferenceOrganizations/OnetoN'),
+		publishers: czIndexRows(doc, '//ReferencePublishers/OnetoN'),
+		keywords: czIndexRows(doc, '//ReferenceKeywords/OnetoN'),
+		groups: czIndexRows(doc, '//ReferenceGroups/OnetoN|//KnowledgeItemGroups/OnetoN'),
+		referenceCategories: czIndexRows(doc, '//ReferenceCategories/OnetoN'),
+		referenceReferences: czIndexRows(doc, '//ReferenceReferences/OnetoN')
+	};
+}
+
+// entspricht ZU.xpathText(doc, '//Block/OnetoN[starts-with(text(), id)]')
+function czRowsText(table, id) {
+	var list = table.bySource[id];
+	return list ? list.join(', ') : null;
+}
+
+// entspricht doc.getElementById(id), ohne jedes Mal den Baum zu durchsuchen
+function czElement(doc, id) {
+	if (czLookup && czLookup.byId[id] !== undefined) return czLookup.byId[id];
+	return doc.getElementById(id);
+}
+
+// Kategorienbaum so lesen, wie Citavi ihn anzeigt.
+//
+// Die Anzeigereihenfolge steht in CategoryCategories: Die Zeile mit der
+// Null-Kennung listet die Wurzelkategorien, jede weitere Zeile die Kinder
+// einer Kategorie, jeweils in der Reihenfolge des Kategoriensystems.
+// (In der Projektdatei steht dieselbe Reihenfolge als Spalte "Index" der
+// Tabelle CategoryCategory.) Die Reihenfolge der <Category>-Elemente ist
+// dagegen die Reihenfolge des Anlegens.
+//
+// Der Originalfilter hat die Wurzeln nach der Anlegereihenfolge nummeriert.
+// Wer in Citavi Hauptkategorien nachtraeglich verschoben hatte, bekam in
+// Zotero deshalb eine verschobene Gliederung. Geprueft am 01.10.2026 mit
+// einem Testprojekt aus Citavi 7.4.
+//
+// Sammlungen (importCategories) und Kat/-Tags (czBuildCategoryPaths) lesen
+// beide diesen Baum, damit Sammlungsname und Tag immer zusammenpassen.
+var CZ_ROOT_ID = "00000000-0000-0000-0000-000000000000";
+
+function czCategoryTree(doc) {
 	var categories = ZU.xpath(doc, '//Categories/Category');
 	var names = {};
 	var order = [];
@@ -202,48 +385,103 @@ function czBuildCategoryPaths(doc) {
 		order.push(cid);
 	}
 
-	// Achtung: Die Zeile mit der Quelle 00000000-0000-0000-0000-000000000000
-	// listet die Wurzelkategorien auf. Wer sie wie eine normale Elternzeile
-	// behandelt, markiert damit jede Wurzel als Kind, bekommt eine leere
-	// Wurzelliste und am Ende gar keine Pfade.
-	var CZ_ROOT = "00000000-0000-0000-0000-000000000000";
 	var childrenOf = {};
-	var isChild = {};
-	var hierarchy = ZU.xpath(doc, '//CategoryCategories/OnetoN');
+	var rootList = [];
+	var parentOf = {};
+	// typo CategoryCatgories was fixed in Citavi 6
+	var hierarchy = ZU.xpath(doc, '//CategoryCatgories/OnetoN|//CategoryCategories/OnetoN');
 	for (let i = 0; i < hierarchy.length; i++) {
 		var row = czParseOneToN(hierarchy[i].textContent);
-		var kids = [];
-		for (let j = 0; j < row.targets.length; j++) {
-			var kid = row.targets[j].id;
+		// Citavi 7 schreibt hier keine Positionen, die Reihenfolge der Zeile
+		// gilt. Falls eine andere Fassung Positionen mitschreibt, wird danach
+		// sortiert. Eintraege ohne Position behalten ihre Stelle.
+		var targets = row.targets.map(function (t, k) {
+			return { id: t.id, position: t.position, k: k };
+		});
+		targets.sort(function (a, b) {
+			var pa = a.position === null ? Infinity : a.position;
+			var pb = b.position === null ? Infinity : b.position;
+			return (pa - pb) || (a.k - b.k);
+		});
+		for (let j = 0; j < targets.length; j++) {
+			var kid = targets[j].id;
 			if (names[kid] === undefined) continue;
-			kids.push(kid);
-			if (row.source != CZ_ROOT) isChild[kid] = true;
-		}
-		childrenOf[row.source] = kids;
-	}
-
-	function walk(ids, prefix) {
-		var index = 1;
-		for (let i = 0; i < ids.length; i++) {
-			var id = ids[i];
-			var number = prefix === null ? String(index) : prefix + "." + index;
-			index++;
-			czCategoryPath[id] = number + " " + names[id];
-			if (childrenOf[id]) walk(childrenOf[id], number);
+			if (row.source == CZ_ROOT_ID) {
+				rootList.push(kid);
+			}
+			// Jede Kategorie nur unter einem Elternteil einhaengen, sonst
+			// wuerde sie doppelt nummeriert.
+			else if (parentOf[kid] === undefined) {
+				parentOf[kid] = row.source;
+				(childrenOf[row.source] || (childrenOf[row.source] = [])).push(kid);
+			}
 		}
 	}
 
-	// Wurzeln in der Reihenfolge, die auch der Originalfilter fuer die
-	// Nummerierung der Sammlungen benutzt: Dokumentreihenfolge der Kategorien.
-	var roots = [];
+	var visited = {};
+	function build(id) {
+		visited[id] = true;
+		var node = { id: id, children: [] };
+		var kids = childrenOf[id] || [];
+		for (let j = 0; j < kids.length; j++) {
+			if (!visited[kids[j]]) node.children.push(build(kids[j]));
+		}
+		return node;
+	}
+
+	var tree = [];
+	// zuerst die Wurzeln in Citavi-Reihenfolge
+	for (let i = 0; i < rootList.length; i++) {
+		var r = rootList[i];
+		if (parentOf[r] === undefined && !visited[r]) tree.push(build(r));
+	}
+	// Rueckfall fuer alles, was keine Wurzelzeile erreicht, etwa bei
+	// Exporten ohne Null-Zeile: Kategorien ohne Elternteil in
+	// Dokumentreihenfolge, danach unerreichbare Reste.
 	for (let i = 0; i < order.length; i++) {
-		if (!isChild[order[i]]) roots.push(order[i]);
+		if (parentOf[order[i]] === undefined && !visited[order[i]]) tree.push(build(order[i]));
 	}
-	walk(roots, null);
+	for (let i = 0; i < order.length; i++) {
+		if (!visited[order[i]]) tree.push(build(order[i]));
+	}
+
+	return { names: names, tree: tree };
+}
+
+// Kategoriennummern fuer Tags und Notizzeilen, dieselbe Zaehlung wie bei
+// den Sammlungsnamen.
+function czBuildCategoryPaths(doc) {
+	var categoryTree = czCategoryTree(doc);
+	function walk(nodes, prefix) {
+		for (let i = 0; i < nodes.length; i++) {
+			var number = prefix === null ? String(i + 1) : prefix + "." + (i + 1);
+			czCategoryPath[nodes[i].id] = number + " " + categoryTree.names[nodes[i].id];
+			walk(nodes[i].children, number);
+		}
+	}
+	walk(categoryTree.tree, null);
 }
 
 function czBuildIndexes(doc) {
 	czBuildCategoryPaths(doc);
+
+	var isUtc = czText(ZU.xpathText(doc, '//ProjectSettings/IsUtc')).toLowerCase();
+	czTimesAreUtc = isUtc != "false";
+
+	// Bezeichnungen der Freitextfelder aus den Projekteinstellungen.
+	// Unter welchem Element Citavi eine geaenderte Bezeichnung ablegt, ist
+	// noch nicht am echten Export geprueft. Gesucht wird deshalb unter
+	// mehreren naheliegenden Namen. Ohne Bezeichnung: "Freitextfeld N".
+	var fieldSettings = ZU.xpath(doc, '//ProjectSettings/CustomFields/CustomFieldSettings');
+	for (let i = 0; i < fieldSettings.length; i++) {
+		var prop = czText(ZU.xpathText(fieldSettings[i], './PropertyName'));
+		var label = "";
+		var candidates = ['Label', 'Name', 'Caption', 'DisplayName', 'Title'];
+		for (let j = 0; j < candidates.length && !label; j++) {
+			label = czText(ZU.xpathText(fieldSettings[i], './' + candidates[j])).trim();
+		}
+		if (prop) czCustomFieldLabels[prop] = label;
+	}
 
 	// Kurzbelege der Titel, fuer lesbare Verweisnotizen
 	var references = ZU.xpath(doc, '//References/Reference');
@@ -266,9 +504,13 @@ function czBuildIndexes(doc) {
 	for (let i = 0; i < kiCats.length; i++) {
 		var rowC = czParseOneToN(kiCats[i].textContent);
 		var listC = czKiCategories[rowC.source] || (czKiCategories[rowC.source] = []);
+		var idsC = czKiCategoryIds[rowC.source] || (czKiCategoryIds[rowC.source] = []);
 		for (let j = 0; j < rowC.targets.length; j++) {
 			var pathC = czCategoryPath[rowC.targets[j].id];
-			if (pathC) listC.push({ path: pathC, position: rowC.targets[j].position });
+			if (pathC) {
+				listC.push({ path: pathC, position: rowC.targets[j].position });
+				idsC.push(rowC.targets[j].id);
+			}
 		}
 	}
 
@@ -313,10 +555,12 @@ function czBuildIndexes(doc) {
 }
 
 // Die Kopfzeile, die den Zitattyp in der Notiz sichtbar macht.
-function czNoteHeadline(node, kiId) {
+function czNoteHeadline(node, kiId, isThought) {
 	var raw = parseInt(ZU.xpathText(node, 'QuotationType'), 10);
 	var typeInfo = czQuotationTypes[isNaN(raw) ? 0 : raw] || czQuotationTypes[0];
+	if (isThought && typeInfo.key == "None") typeInfo = czThoughtType;
 	var bits = [typeInfo.label];
+	if (isThought) bits.push("ohne Titelbezug");
 
 	var pages = extractPages(ZU.xpathText(node, 'PageRange'));
 	if (pages) bits.push("S. " + pages);
@@ -333,9 +577,13 @@ function czNoteHeadline(node, kiId) {
 	return { typeInfo: typeInfo, line: "[" + czEscape(bits.join(" | ")) + "]" };
 }
 
-function czNoteTags(kiId, typeInfo) {
+function czNoteTags(kiId, typeInfo, node) {
 	var tags = [];
 	if (CZ.typeAsTag) tags.push(CZ.tagPrefixType + typeInfo.tag);
+	if (CZ.ratingsAsTags && node) {
+		var relevance = parseInt(ZU.xpathText(node, 'Relevance'), 10);
+		if (relevance > 0) tags.push("Relevanz/" + relevance);
+	}
 	if (CZ.kiCategoriesAsTags && czKiCategories[kiId]) {
 		for (let i = 0; i < czKiCategories[kiId].length; i++) {
 			tags.push(CZ.tagPrefixCategory + czKiCategories[kiId][i].path);
@@ -383,7 +631,7 @@ function czLinkNote(refId) {
 		if (link.relation) bits.push("Bewertung: " + link.relation);
 		if (link.page) bits.push("S. " + czEscape(link.page));
 		body += "<p>" + bits.join(" | ") + "</p>\n";
-		if (link.notes) body += "<blockquote>" + czEscape(link.notes) + "</blockquote>\n";
+		if (link.notes) body += "<blockquote>" + czPlainToHtml(link.notes) + "</blockquote>\n";
 		if (CZ.writeCitaviIds) body += "<p><em>Citavi-ID des Gegenstücks: " + otherId + "</em></p>\n";
 		count++;
 	}
@@ -393,13 +641,13 @@ function czLinkNote(refId) {
 // Alle Standorte eines Titels, weil Zotero nur ein Signaturfeld hat
 function czLocationNote(doc, refId) {
 	if (!CZ.allLocationsAsNote) return null;
-	var locations = ZU.xpath(doc, '//Locations/Location[ReferenceID="' + refId + '"]');
+	var locations = czLookup.locationsByRef[refId] || [];
 	var rows = [];
 	for (let j = 0; j < locations.length; j++) {
 		var callNumber = czText(ZU.xpathText(locations[j], 'CallNumber'));
 		var libraryId = czText(ZU.xpathText(locations[j], 'LibraryID'));
 		if (!callNumber && !libraryId) continue;
-		var library = libraryId ? czText(ZU.xpathText(doc.getElementById(libraryId), "Name")) : "";
+		var library = libraryId ? czText(ZU.xpathText(czElement(doc, libraryId), "Name")) : "";
 		var note = czText(ZU.xpathText(locations[j], 'Notes'));
 		rows.push("<p>" + czEscape(library) + (callNumber ? " — " + czEscape(callNumber) : "")
 			+ (note ? " (" + czEscape(note) + ")" : "") + "</p>");
@@ -465,11 +713,11 @@ async function importItems({ references, doc, citaviVersion, rememberTags, itemI
 			// das Nachbearbeitungsskript sie in die echten Felder setzt.
 			if (czCreated) {
 				item.dateAdded = czCreated;
-				addExtraLine(item, "Citavi-Erstellt", czCreated);
+				addExtraLine(item, "Citavi-Erstellt", czLocalTime(czCreated));
 			}
 			if (czModified) {
 				item.dateModified = czModified;
-				addExtraLine(item, "Citavi-Geaendert", czModified);
+				addExtraLine(item, "Citavi-Geaendert", czLocalTime(czModified));
 			}
 		}
 		if (CZ.writeCitaviIds) {
@@ -488,18 +736,25 @@ async function importItems({ references, doc, citaviVersion, rememberTags, itemI
 		for (var field of ['Notes', 'TableOfContents', 'Evaluation']) {
 			var note = ZU.xpathText(references[i], './' + field);
 			if (note) {
+				// Erweiterung v2: Klartext maskieren und Zeilen erhalten.
+				// Felder mit Formatierung (Complexity ungleich 0) bleiben
+				// unveraendert wie in v1, ihr Format ist noch ungeprueft.
+				var complexity = czText(ZU.xpathText(references[i], './' + field + 'Complexity'));
+				if (!complexity || complexity === "0" || complexity === "PureText") {
+					note = "<p>" + czPlainToHtml(note) + "</p>";
+				}
 				item.notes.push({ note: note, tags: ["#" + field] });
 			}
 		}
 
 		var seriesID = ZU.xpathText(references[i], './SeriesTitleID');
 		if (seriesID) {
-			item.series = ZU.xpathText(doc.getElementById(seriesID), './Name');
+			item.series = ZU.xpathText(czElement(doc, seriesID), './Name');
 		}
 
 		var periodicalID = ZU.xpathText(references[i], './PeriodicalID');
 		if (periodicalID) {
-			var periodical = doc.getElementById(periodicalID);
+			var periodical = czElement(doc, periodicalID);
 			item.publicationTitle = ZU.xpathText(periodical, './Name');
 			item.ISSN = ZU.xpathText(periodical, './ISSN');
 			item.journalAbbreviation = ZU.xpathText(periodical, './StandardAbbreviation')
@@ -507,21 +762,21 @@ async function importItems({ references, doc, citaviVersion, rememberTags, itemI
 				|| ZU.xpathText(periodical, './UserAbbreviation2');
 		}
 
-		var authors = ZU.xpathText(doc, '//ReferenceAuthors/OnetoN[starts-with(text(), "' + item.itemID + '")]');
+		var authors = czRowsText(czLookup.authors, item.itemID);
 		attachPersons(doc, item, authors, "author");
-		var editors = ZU.xpathText(doc, '//ReferenceEditors/OnetoN[starts-with(text(), "' + item.itemID + '")]');
+		var editors = czRowsText(czLookup.editors, item.itemID);
 		attachPersons(doc, item, editors, "editor");
-		var collaborators = ZU.xpathText(doc, '//ReferenceCollaborators/OnetoN[starts-with(text(), "' + item.itemID + '")]');
+		var collaborators = czRowsText(czLookup.collaborators, item.itemID);
 		attachPersons(doc, item, collaborators, "contributor");
-		var organizations = ZU.xpathText(doc, '//ReferenceOrganizations/OnetoN[starts-with(text(), "' + item.itemID + '")]');
+		var organizations = czRowsText(czLookup.organizations, item.itemID);
 		attachPersons(doc, item, organizations, "contributor");
 
-		var publishers = ZU.xpathText(doc, '//ReferencePublishers/OnetoN[starts-with(text(), "' + item.itemID + '")]');
+		var publishers = czRowsText(czLookup.publishers, item.itemID);
 		if (publishers && publishers.length > 0) {
 			item.publisher = attachName(doc, publishers).join('; ');
 		}
 
-		var keywords = ZU.xpathText(doc, '//ReferenceKeywords/OnetoN[starts-with(text(), "' + item.itemID + '")]');
+		var keywords = czRowsText(czLookup.keywords, item.itemID);
 		if (keywords && keywords.length > 0) {
 			item.tags = attachName(doc, keywords);
 		}
@@ -531,18 +786,35 @@ async function importItems({ references, doc, citaviVersion, rememberTags, itemI
 			}
 		}
 
+		// --- Erweiterung v2: Bewertung, Markierungen, Freitextfelder ---
+		if (CZ.ratingsAsTags) {
+			var czRating = parseInt(ZU.xpathText(references[i], './Rating'), 10);
+			if (czRating > 0) item.tags.push("Bewertung/" + czRating);
+			if (czText(ZU.xpathText(references[i], './HasLabel1')) == "true") item.tags.push("Markierung/1");
+			if (czText(ZU.xpathText(references[i], './HasLabel2')) == "true") item.tags.push("Markierung/2");
+		}
+		if (CZ.customFieldsToExtra) {
+			for (let k = 1; k <= 9; k++) {
+				var czField = czText(ZU.xpathText(references[i], './CustomField' + k)).trim();
+				if (!czField) continue;
+				// Vorsilbe "Citavi-", damit Zotero die Zeile nicht als
+				// CSL-Variable deutet (etwa bei einer Bezeichnung "Status")
+				addExtraLine(item, "Citavi-" + (czCustomFieldLabels['CustomField' + k] || "Freitextfeld " + k),
+					czField.replace(/\s*\r?\n\s*/g, " / "));
+			}
+		}
+
 		// For all corresponding knowledge items attach a note containing
 		// the information of it.
-		var citations = ZU.xpath(doc, '//KnowledgeItem[ReferenceID="' + item.itemID + '"]');
+		var citations = czLookup.kisByRef[item.itemID] || [];
 		for (let j = 0; j < citations.length; j++) {
 			var noteObject = {};
 			noteObject.id = ZU.xpathText(citations[j], '@id');
 			var title = ZU.xpathText(citations[j], 'CoreStatement');
-			var text = ZU.xpathText(citations[j], 'Text');
 			var pages = extractPages(ZU.xpathText(citations[j], 'PageRange'));
 			noteObject.note = '';
 			if (title) {
-				noteObject.note += '<h1>' + title + "</h1>\n";
+				noteObject.note += '<h1>' + czEscape(title) + "</h1>\n";
 			}
 
 			// --- Erweiterung: Art des Wissenselements sichtbar machen ---
@@ -555,9 +827,8 @@ async function importItems({ references, doc, citaviVersion, rememberTags, itemI
 				noteObject.note += "<p><strong>" + czHead.line + "</strong></p>\n";
 			}
 
-			if (text) {
-				noteObject.note += "<p>" + ZU.xpathText(citations[j], 'Text') + "</p>\n";
-			}
+			// Erweiterung v2: maskiert, mit Absaetzen, formatiert falls moeglich
+			noteObject.note += czKnowledgeItemText(citations[j]);
 			if (pages) {
 				noteObject.note += "<i>" + pages + "</i>";
 			}
@@ -566,7 +837,7 @@ async function importItems({ references, doc, citaviVersion, rememberTags, itemI
 			noteObject.note += czCommentLinkLines(noteObject.id);
 
 			// --- Erweiterung: Tags fuer Typ, Kategorie und Schlagwort ---
-			noteObject.tags = (rememberTags[noteObject.id] || []).concat(czNoteTags(noteObject.id, czHead.typeInfo));
+			noteObject.tags = (rememberTags[noteObject.id] || []).concat(czNoteTags(noteObject.id, czHead.typeInfo, citations[j]));
 
 			// --- Erweiterung: Arbeitsspuren der Notiz ---
 			if (CZ.keepDates) {
@@ -579,8 +850,7 @@ async function importItems({ references, doc, citaviVersion, rememberTags, itemI
 				// Das Nachbearbeitungsskript liest sie von dort und kann die
 				// Zeile danach entfernen.
 				if (czKiCreated || czKiModified) {
-					noteObject.note += "<p><em>Citavi: erstellt " + (czKiCreated || "?")
-						+ ", geändert " + (czKiModified || "?") + "</em></p>\n";
+					noteObject.note += czDateFooter(czKiCreated, czKiModified);
 				}
 			}
 
@@ -616,7 +886,7 @@ async function importItems({ references, doc, citaviVersion, rememberTags, itemI
 		}
 
 		// Locations will be saved as URIs in attachments, DOI, extra etc.
-		var locations = ZU.xpath(doc, '//Locations/Location[ReferenceID="' + item.itemID + '"]');
+		var locations = czLookup.locationsByRef[item.itemID] || [];
 		// If we only have partial information about the callnumber or
 		// library location, then we save this info in these two arrays
 		// which will then processed after the for loop if no other info
@@ -652,13 +922,13 @@ async function importItems({ references, doc, citaviVersion, rememberTags, itemI
 			var libraryId = ZU.xpathText(locations[j], 'LibraryID');
 			if (callNumber && libraryId) {
 				item.callNumber = callNumber;
-				item.libraryCatalog = ZU.xpathText(doc.getElementById(libraryId), "Name");
+				item.libraryCatalog = ZU.xpathText(czElement(doc, libraryId), "Name");
 			}
 			else if (callNumber) {
 				onlyCallNumber.push(callNumber);
 			}
 			else if (libraryId) {
-				onlyLibraryInfo.push(ZU.xpathText(doc.getElementById(libraryId), "Name"));
+				onlyLibraryInfo.push(ZU.xpathText(czElement(doc, libraryId), "Name"));
 			}
 		}
 		if (!item.callNumber) {
@@ -715,7 +985,8 @@ async function importItems({ references, doc, citaviVersion, rememberTags, itemI
 async function importUnfinished({ doc, itemIdList, progress, unfinishedReferences }) {
 	for (var i = 0; i < unfinishedReferences.length; i++) {
 		var item = unfinishedReferences[i];
-		var containerString = ZU.xpathText(doc, `//ReferenceReferences/OnetoN[contains(text(), "${item.itemID}")]`);
+		var containerRows = czLookup.referenceReferences.byAnyId[item.itemID];
+		var containerString = containerRows ? containerRows.join(', ') : null;
 		if (containerString) {
 			var containerId = containerString.split(';')[0];
 			var containerItem = itemIdList[containerId];
@@ -758,14 +1029,14 @@ async function importTasks({ tasks, progress }) {
 		let item = new Zotero.Item("note");
 		var dueDate = ZU.xpathText(tasks[i], './DueDate');
 		if (dueDate) {
-			item.note = "<h1>" + ZU.xpathText(tasks[i], './Name') + " until " + dueDate + "</h1>";
+			item.note = "<h1>" + czEscape(ZU.xpathText(tasks[i], './Name')) + " until " + czEscape(dueDate) + "</h1>";
 		}
 		else {
-			item.note = "<h1>" + ZU.xpathText(tasks[i], './Name') + "</h1>";
+			item.note = "<h1>" + czEscape(ZU.xpathText(tasks[i], './Name')) + "</h1>";
 		}
 		var noteText = ZU.xpathText(tasks[i], './Notes');
 		if (noteText) {
-			item.note += "\n" + noteText;
+			item.note += "\n<p>" + czPlainToHtml(noteText) + "</p>";
 		}
 
 		// --- Erweiterung: Bezug zum Titel lesbar festhalten ---
@@ -777,6 +1048,59 @@ async function importTasks({ tasks, progress }) {
 		}
 
 		item.tags.push("#todo");
+		await item.complete(); // eslint-disable-line no-await-in-loop
+		Z.setProgress(++progress.current / progress.total * 100);
+	}
+}
+
+// --- Erweiterung: freie Gedanken ---
+// Wissenselemente ohne Titelbezug uebergeht der Originalfilter, weil er
+// Notizen nur an Titeln anlegt. Sie werden hier zu Einzelnotizen mit
+// Typzeile und Tags wie jedes andere Wissenselement. Anders als Notizen an
+// Titeln koennen Einzelnotizen in Sammlungen liegen: importCategories legt
+// sie deshalb zusaetzlich in die Sammlungen ihrer Kategorien.
+async function czImportThoughts({ thoughts, rememberTags, progress }) {
+	for (let i = 0; i < thoughts.length; i++) {
+		var node = thoughts[i];
+		var kiId = ZU.xpathText(node, '@id');
+		var item = new Zotero.Item("note");
+		item.itemID = kiId; // damit die Sammlungen die Notiz wiederfinden
+
+		var title = ZU.xpathText(node, 'CoreStatement');
+		var pages = extractPages(ZU.xpathText(node, 'PageRange'));
+		var head = czNoteHeadline(node, kiId, true);
+
+		var html = "";
+		if (title) html += "<h1>" + czEscape(title) + "</h1>\n";
+		if (CZ.typeLineInNote) html += "<p><strong>" + head.line + "</strong></p>\n";
+		html += czKnowledgeItemText(node);
+		if (pages) html += "<i>" + pages + "</i>";
+		html += czCommentLinkLines(kiId);
+
+		if (CZ.keepDates) {
+			var created = czDate(ZU.xpathText(node, 'CreatedOn'));
+			var modified = czDate(ZU.xpathText(node, 'ModifiedOn'));
+			if (created || modified) html += czDateFooter(created, modified);
+		}
+
+		// Eine Einzelnotiz kann keinen Anhang tragen. Eine zugehoerige
+		// Datei wird deshalb nur als Zeile vermerkt.
+		var address = ZU.xpathText(node, 'Address');
+		if (address) {
+			var uri = address;
+			try {
+				var json = JSON.parse(address);
+				uri = json.UriString || json.OriginalString;
+			}
+			catch (e) {
+				// Citavi 5 speichert die Adresse im Klartext
+			}
+			if (uri) html += "<p><em>Zugehörige Datei: " + czEscape(uri) + "</em></p>\n";
+		}
+
+		item.note = html;
+		item.tags = (rememberTags[kiId] || []).concat(czNoteTags(kiId, head.typeInfo, node), ["#Gedanke"]);
+		czThoughtIds.push(kiId);
 		await item.complete(); // eslint-disable-line no-await-in-loop
 		Z.setProgress(++progress.current / progress.total * 100);
 	}
@@ -794,14 +1118,11 @@ function addHierarchyNumberRecursive(collections, level = null) {
 }
 
 function importCategories({ categories, doc, progress }) {
-	// typo CategoryCatgories was fixed in Citavi 6
-	var hierarchy = ZU.xpath(doc, '//CategoryCatgories/OnetoN|//CategoryCategories/OnetoN');
-
-	const parentMap = new Map();
-	for (let i = 0, n = hierarchy.length; i < n; i++) {
-		var categoryLists = hierarchy[i].textContent.split(";");
-		parentMap.set(categoryLists[0], categoryLists.slice(1));
-	}
+	// --- Erweiterung: Baum und Reihenfolge kommen aus czCategoryTree ---
+	// Der Originalfilter hat die Wurzeln in Dokumentreihenfolge der
+	// <Category>-Elemente nummeriert, also in der Reihenfolge des Anlegens.
+	// Siehe die Erlaeuterung bei czCategoryTree.
+	var categoryTree = czCategoryTree(doc);
 
 	// Create a Zotero collection for each Citavi category
 	const collectionsMap = new Map();
@@ -813,48 +1134,64 @@ function importCategories({ categories, doc, progress }) {
 		collection.children = [];
 
 		// Assign items to collections
-		var referenceCategories = ZU.xpath(doc, '//ReferenceCategories/OnetoN[contains(text(), "' + collection.id + '")]');
+		var referenceCategories = czLookup.referenceCategories.byAnyId[collection.id] || [];
 		for (let j = 0; j < referenceCategories.length; j++) {
-			var refid = referenceCategories[j].textContent.split(';')[0];
+			var refid = referenceCategories[j].split(';')[0];
 			collection.children.push({ type: 'item', id: refid });
 		}
 		collectionsMap.set(collection.id, collection);
 	}
 
-	const addedChildIDs = [];
-
-	// Recreate collections hierarchy
-	for (const [parentID, childIDs] of parentMap.entries()) {
-		if (!collectionsMap.has(parentID)) {
-			continue;
-		}
-		const parentCollection = collectionsMap.get(parentID);
-
-		childIDs.forEach((childID) => {
-			if (collectionsMap.has(childID)) {
-				parentCollection.children.push(collectionsMap.get(childID));
-				addedChildIDs.push(childID);
+	// --- Erweiterung v2: Titel in die Kategorien ihrer Wissenselemente ---
+	if (CZ.referencesIntoKnowledgeCategories) {
+		for (const kiId of Object.keys(czKiCategoryIds)) {
+			const refId = czKiParent[kiId];
+			if (!refId) continue;
+			for (const categoryId of czKiCategoryIds[kiId]) {
+				const target = collectionsMap.get(categoryId);
+				if (target && !target.children.some(c => c.type == 'item' && c.id == refId)) {
+					target.children.push({ type: 'item', id: refId });
+				}
 			}
-		});
+		}
 	}
 
-	// skip collections that were successfuly assigned to a parent
-	for (const childID of addedChildIDs) {
-		collectionsMap.delete(childID);
+	// --- Erweiterung: freie Gedanken in die Sammlungen ihrer Kategorien ---
+	for (const thoughtId of czThoughtIds) {
+		for (const categoryId of (czKiCategoryIds[thoughtId] || [])) {
+			const target = collectionsMap.get(categoryId);
+			if (target) target.children.push({ type: 'item', id: thoughtId });
+		}
 	}
+
+	// Recreate collections hierarchy in Citavi order
+	function attachChildren(nodes) {
+		const result = [];
+		for (const node of nodes) {
+			const current = collectionsMap.get(node.id);
+			if (!current) continue;
+			for (const child of attachChildren(node.children)) {
+				current.children.push(child);
+			}
+			result.push(current);
+		}
+		return result;
+	}
+	const rootCollections = attachChildren(categoryTree.tree);
 
 	// add hierarchy number to a collection name (e.g. 1 for first root
 	// collection and 1.1, 1.2 etc. for subcollections)
-	addHierarchyNumberRecursive(collectionsMap.values());
+	addHierarchyNumberRecursive(rootCollections);
 
-	for (const collection of collectionsMap.values()) {
-		collection.complete();
+	for (const rootCollection of rootCollections) {
+		rootCollection.complete();
 		Z.setProgress(++progress.current / progress.total * 100);
 	}
 }
 
 async function doImport() {
 	var doc = Zotero.getXML();
+	czBuildLookup(doc); // Erweiterung v2: Nachschlagetabellen
 	var citaviVersion = ZU.xpathText(doc, '//CitaviExchangeData/@Version');
 
 	// Groups will also be mapped to tags which can be assigned to
@@ -864,9 +1201,9 @@ async function doImport() {
 	for (var i = 0; i < groups.length; i++) {
 		var id = ZU.xpathText(groups[i], './@id');
 		var name = ZU.xpathText(groups[i], './Name');
-		var referenceGroups = ZU.xpath(doc, `//ReferenceGroups/OnetoN[contains(text(), "${id}")]|//KnowledgeItemGroups/OnetoN[contains(text(), "${id}")]`);
+		var referenceGroups = czLookup.groups.byAnyId[id] || [];
 		for (var j = 0; j < referenceGroups.length; j++) {
-			var refid = referenceGroups[j].textContent.split(';')[0];
+			var refid = referenceGroups[j].split(';')[0];
 			if (rememberTags[refid]) {
 				rememberTags[refid].push(name);
 			}
@@ -881,6 +1218,8 @@ async function doImport() {
 
 	var tasks = ZU.xpath(doc, '//TaskItems/TaskItem');
 	var categories = ZU.xpath(doc, '//Categories/Category');
+	// --- Erweiterung: freie Gedanken, also Wissenselemente ohne Titel ---
+	var thoughts = ZU.xpath(doc, '//KnowledgeItems/KnowledgeItem[not(ReferenceID) or normalize-space(ReferenceID)=""]');
 
 	// Main information for each reference.
 	var references = ZU.xpath(doc, '//References/Reference');
@@ -889,12 +1228,13 @@ async function doImport() {
 
 	// Because Zotero may also import annotations, we only move progress within 0-50% range, hence `totalProgress * 2`
 	// https://github.com/zotero/zotero/blob/6ca854a018e8bfe4251fbf42610276c441b5d943/chrome/content/zotero/import/citavi.js#L28
-	const totalProgress = references.length + tasks.length + categories.length;
+	const totalProgress = references.length + tasks.length + categories.length + thoughts.length;
 	const progress = { total: totalProgress * 2, current: 0 };
 
 	await importItems({ references, doc, citaviVersion, rememberTags, itemIdList, progress, unfinishedReferences });
 	await importUnfinished({ doc, itemIdList, unfinishedReferences, progress });
 	await importTasks({ tasks, progress });
+	await czImportThoughts({ thoughts, rememberTags, progress });
 	importCategories({ categories, doc, progress });
 }
 
@@ -908,7 +1248,7 @@ function attachName(doc, ids) {
 	var idList = ids.split(';');
 	// skip the first element which is the id of reference
 	for (var j = 1; j < idList.length; j++) {
-		var author = doc.getElementById(idList[j]);
+		var author = czElement(doc, idList[j]);
 		valueList.push(ZU.xpathText(author, 'Name'));
 	}
 	return valueList;
@@ -924,7 +1264,7 @@ function attachPersons(doc, item, ids, type) {
 	var authorIds = ids.split(';');
 	// skip the first element which is the id of reference
 	for (var j = 1; j < authorIds.length; j++) {
-		var author = doc.getElementById(authorIds[j]);
+		var author = czElement(doc, authorIds[j]);
 		var lastName = ZU.xpathText(author, 'LastName');
 		var firstName = ZU.xpathText(author, 'FirstName');
 		var middleName = ZU.xpathText(author, 'MiddleName');
